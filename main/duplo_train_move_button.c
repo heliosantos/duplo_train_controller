@@ -4,35 +4,112 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
 
 static const char *TAG = "BLE_CONNECT";
+
+static bool device_connected = false;
 static uint8_t own_addr_type;
+static bool scanning = false;
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
-    if (event->type == BLE_GAP_EVENT_CONNECT) {
-        if (event->connect.status == 0) {
-            ESP_LOGI(TAG, "Connected to Train Base!");
-        } else {
-            ESP_LOGE(TAG, "Failed to connect: %d", event->connect.status);
+    switch (event->type) {
+        case BLE_GAP_EVENT_DISC: {
+            struct ble_hs_adv_fields fields;
+            if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
+                if (fields.name && fields.name_len > 0) {
+                    char name[32] = {0};
+                    memcpy(name, fields.name, fields.name_len);
+                    name[fields.name_len] = '\0';
+
+                    ESP_LOGI(TAG, "Discovered device: %s", name);
+
+                    if (!device_connected && strcmp(name, "Train Base") == 0) {
+                        ESP_LOGI(TAG, "Found Train Base, connecting...");
+
+                        ble_addr_t *addr = &event->disc.addr;
+                        ESP_LOGI(TAG, "Connecting to %02X:%02X:%02X:%02X:%02X:%02X, addr type %d, own_addr_type %d",
+                                 addr->val[5], addr->val[4], addr->val[3], addr->val[2], addr->val[1], addr->val[0],
+                                 addr->type, own_addr_type);
+
+                        int rc = ble_gap_connect(own_addr_type, addr, 30000, NULL, ble_gap_event, NULL);
+                        if (rc != 0) {
+                            ESP_LOGE(TAG, "Failed to connect: %d", rc);
+                        } else {
+                            device_connected = true;
+                            scanning = false;
+                        }
+                    }
+                }
+            }
+            return 0;
         }
-    } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
-        ESP_LOGI(TAG, "Disconnected");
+
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                ESP_LOGI(TAG, "Connected to Train Base!");
+                scanning = false;
+            } else {
+                ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
+                device_connected = false;
+                // Optionally restart scanning here if needed
+            }
+            return 0;
+
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI(TAG, "Disconnected; reason=%d", event->disconnect.reason);
+            device_connected = false;
+            // Restart scanning after disconnect
+            if (!scanning) {
+                struct ble_gap_disc_params scan_params = {
+                    .passive = 0,
+                    .filter_duplicates = 1,
+                    .itvl = 0x0010,
+                    .window = 0x0010,
+                    .filter_policy = 0,
+                    .limited = 0,
+                };
+                int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &scan_params, ble_gap_event, NULL);
+                if (rc != 0) {
+                    ESP_LOGE(TAG, "Error restarting scan; rc=%d", rc);
+                } else {
+                    scanning = true;
+                    ESP_LOGI(TAG, "Restarted scanning after disconnect");
+                }
+            }
+            return 0;
+
+        default:
+            return 0;
     }
-    return 0;
 }
 
 void ble_app_on_sync(void) {
-    ble_addr_t addr = {
-        .type = 0,
-        .val = {0x16, 0xF9, 0x51, 0x65, 0x6C, 0xA0} 
+    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    assert(rc == 0);
+
+    ESP_LOGI(TAG, "BLE Host synced, own_addr_type=%d", own_addr_type);
+
+    struct ble_gap_disc_params scan_params = {
+        .passive = 0,
+        .filter_duplicates = 1,
+        .itvl = 0x0010,
+        .window = 0x0010,
+        .filter_policy = 0,
+        .limited = 0,
     };
-    ble_hs_id_infer_auto(0, &own_addr_type);
-    ble_gap_connect(own_addr_type, &addr, 30000, NULL, ble_gap_event, NULL);
-    ESP_LOGI(TAG, "Connecting to Train Base...");
+
+    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &scan_params, ble_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Error starting scan; rc=%d", rc);
+    } else {
+        scanning = true;
+        ESP_LOGI(TAG, "Started scanning");
+    }
 }
 
 void ble_host_task(void *param) {
@@ -41,9 +118,17 @@ void ble_host_task(void *param) {
 }
 
 void app_main(void) {
-    nvs_flash_init();
-    nimble_port_init();
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(nimble_port_init());
+
     ble_hs_cfg.sync_cb = ble_app_on_sync;
+
     nimble_port_freertos_init(ble_host_task);
 }
 
