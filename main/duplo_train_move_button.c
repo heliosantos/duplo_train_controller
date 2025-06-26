@@ -30,13 +30,13 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 
                     if (!device_connected && strcmp(name, "Train Base") == 0) {
                         ESP_LOGI(TAG, "Found Train Base, connecting...");
-
+                        
+                        ble_gap_disc_cancel(); // cancel the scan
+                                               //
                         ble_addr_t *addr = &event->disc.addr;
-                        ESP_LOGI(TAG, "Connecting to %02X:%02X:%02X:%02X:%02X:%02X, addr type %d, own_addr_type %d",
-                                 addr->val[5], addr->val[4], addr->val[3], addr->val[2], addr->val[1], addr->val[0],
-                                 addr->type, own_addr_type);
 
                         int rc = ble_gap_connect(own_addr_type, addr, 30000, NULL, ble_gap_event, NULL);
+
                         if (rc != 0) {
                             ESP_LOGE(TAG, "Failed to connect: %d", rc);
                         } else {
