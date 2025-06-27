@@ -12,11 +12,6 @@
 #include "driver/gpio.h"
 
 
-#define BUTTON_GPIO 0
-#define LED_GPIO 8
-
-
-
 static const char *TAG = "BLE_CONNECT";
 
 // 00001624-1212-efde-1623-785feabcd123
@@ -32,7 +27,6 @@ char target_uuid_str[BLE_UUID_STR_LEN];
 static uint16_t conn_handle;
 static uint16_t char_val_handle;
 
-int button_state = 0;
 
 static int discover_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     const struct ble_gatt_chr *chr, void *arg) {
@@ -164,6 +158,48 @@ void ble_host_task(void *param) {
   nimble_port_freertos_deinit();
 }
 
+void config_gpio(void) {
+
+  // Configure button input
+    gpio_config_t btn_conf = {
+        .pin_bit_mask = 1ULL << 0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE, // Button usually pulls to ground
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&btn_conf);
+
+    btn_conf.pin_bit_mask = 1ULL << 1;
+    gpio_config(&btn_conf);
+
+    btn_conf.pin_bit_mask = 1ULL << 2;
+    gpio_config(&btn_conf);
+
+
+    // Configure LED output
+    gpio_config_t led_conf = {
+        .pin_bit_mask = 1ULL << 8,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&led_conf);
+
+}
+
+void move(int throttle) {
+  if (throttle < 0) {
+    throttle = 256 + throttle;
+  }
+
+  uint8_t data[] = {0x08, 0x00, 0x81, 0x00, 0x11, 0x51, 0x00, throttle};
+  int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data, sizeof(data), NULL, NULL);
+  if (rc != 0) ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
+}
 
 void app_main(void) {
   esp_err_t ret = nvs_flash_init();
@@ -171,57 +207,79 @@ void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ret = nvs_flash_init();
   }
+
   ESP_ERROR_CHECK(ret);
-
   ESP_ERROR_CHECK(nimble_port_init());
-
   ble_hs_cfg.sync_cb = ble_app_on_sync;
 
   nimble_port_freertos_init(ble_host_task);
+  config_gpio();
+  int throttle = 0;
+  int prev_button_state = 1; 
+  int prev_back_button_state = 1; 
 
-  // Configure button input
-    gpio_config_t btn_conf = {
-        .pin_bit_mask = 1ULL << BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // Button usually pulls to ground
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&btn_conf);
+  while (1) {
 
-    // Configure LED output
-    gpio_config_t led_conf = {
-        .pin_bit_mask = 1ULL << LED_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&led_conf);
+    int button_state = gpio_get_level(0);
 
-    while (1) {
-      int prev_button_state = button_state;
+    if (button_state == 0 && prev_button_state == 1) {
 
-      button_state = gpio_get_level(BUTTON_GPIO);
-      //gpio_set_level(LED_GPIO, button_state == 0 ? 0 : 1); // Active low
+      if (throttle < 0) {
+        move(0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        throttle = 0;
+      }
 
-
-      if (prev_button_state != button_state) {
-        prev_button_state = button_state;
-        
-        uint8_t data2[] = {0x08, 0x00, 0x81, 0x00, 0x11, 0x51, 0x00, button_state == 0 ? 50 : 0};
-
-        int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data2, sizeof(data2), NULL, NULL);
-
-        if (rc != 0) {
-          ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
-        } else {
-          ESP_LOGI(TAG, "✅ Write successful");
+      if (throttle < 40) {
+        throttle = 40;
+      } else {
+        throttle += 10;
+        if (throttle > 100) {
+          throttle = 100;
         }
-      }      
+      }
 
-      vTaskDelay(pdMS_TO_TICKS(100));
+      ESP_LOGI(TAG, "Throttle: %i", throttle);
+     
+      move(throttle);
+    }      
 
+    prev_button_state = button_state;
+
+    if (gpio_get_level(1) == 0) {
+      throttle = 0;
+      move(0);
     }
+
+
+    int back_button_state = gpio_get_level(2);
+
+    if (back_button_state == 0 && prev_back_button_state == 1) {
+
+      if (throttle > 0) {
+        move(0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        throttle = 0;
+      }
+
+      if (throttle > -40) {
+        throttle = -40;
+      } else {
+        throttle -= 10;
+        if (throttle < -100) {
+          throttle = -100;
+        }
+      }
+
+      ESP_LOGI(TAG, "Throttle: %i", throttle);
+     
+      move(throttle);
+    }      
+    
+    prev_back_button_state = back_button_state;
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+  }
 }
 
