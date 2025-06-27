@@ -1,25 +1,26 @@
 #include <stdio.h>
 #include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
+#include "driver/gpio.h"
+
+
+#define BUTTON_GPIO 0
+#define LED_GPIO 8
+
+
 
 static const char *TAG = "BLE_CONNECT";
 
 // 00001624-1212-efde-1623-785feabcd123
-static const ble_uuid128_t target_char_uuid = BLE_UUID128_INIT(
-    0x23, 0xd1, 0xbc, 0xea,
-    0x5f, 0x78,
-    0x23, 0x16,
-    0xde, 0xef,
-    0x12, 0x12, 0x24, 0x16, 0x00, 0x00
-    );
+static const ble_uuid128_t target_char_uuid = BLE_UUID128_INIT(0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x23, 0x16, 0xde, 0xef, 0x12, 0x12, 0x24, 0x16, 0x00, 0x00);
 
 static bool device_connected = false;
 static uint8_t own_addr_type;
@@ -28,9 +29,10 @@ static bool scanning = false;
 char uuid_str[BLE_UUID_STR_LEN];
 char target_uuid_str[BLE_UUID_STR_LEN];
 
-
 static uint16_t conn_handle;
 static uint16_t char_val_handle;
+
+int button_state = 0;
 
 static int discover_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     const struct ble_gatt_chr *chr, void *arg) {
@@ -43,21 +45,6 @@ static int discover_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     if (ble_uuid_cmp(&chr->uuid.u, &target_char_uuid.u) == 0) {
       ESP_LOGI(TAG, "🎯 Found target char! Saving handle: 0x%04x", chr->val_handle);
       char_val_handle = chr->val_handle;
-
-
-      uint8_t data2[] = {0x08, 0x00, 0x81, 0x00, 0x11, 0x51, 0x00, 50};
-      //uint8_t data2[] = {0x08, 0x00, 0x81, 0x11, 0x11, 0x51, 0x00, 7}; //  light
-
-      int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data2, sizeof(data2), NULL, NULL);
-
-      if (rc != 0) {
-        ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
-      } else {
-        ESP_LOGI(TAG, "✅ Write successful");
-      }
-
-
-
     }
   }
 
@@ -108,35 +95,8 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                                ESP_LOGI(TAG, "Connected to Train Base!");
                                scanning = false;
 
-
                                discover_characteristics();
-                               /* 
-                                  uint8_t data[] = {0x0a, 0x00, 0x41, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01}; // setup
 
-                                  int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data, sizeof(data), NULL, NULL);
-
-                                  if (rc != 0) {
-                                  ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
-                                  } else {
-                                  ESP_LOGI(TAG, "✅ Write successful");
-                                  }
-
-                                  vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-                                  uint8_t data2[] = {0x08, 0x00, 0x81, 0x00, 0x11, 0x51, 0x00, 50};
-                               //uint8_t data2[] = {0x08, 0x00, 0x81, 0x11, 0x11, 0x51, 0x00, 7}; //  light
-
-                               rc = ble_gattc_write_flat(conn_handle, char_val_handle, data2, sizeof(data2), NULL, NULL);
-
-
-                               if (rc != 0) {
-                               ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
-                               } else {
-                               ESP_LOGI(TAG, "✅ Write successful");
-                               }
-
-                               vTaskDelay(5000 / portTICK_PERIOD_MS);
-                               */
                              } else {
                                ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
                                device_connected = false;
@@ -218,5 +178,50 @@ void app_main(void) {
   ble_hs_cfg.sync_cb = ble_app_on_sync;
 
   nimble_port_freertos_init(ble_host_task);
+
+  // Configure button input
+    gpio_config_t btn_conf = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE, // Button usually pulls to ground
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_conf);
+
+    // Configure LED output
+    gpio_config_t led_conf = {
+        .pin_bit_mask = 1ULL << LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&led_conf);
+
+    while (1) {
+      int prev_button_state = button_state;
+
+      button_state = gpio_get_level(BUTTON_GPIO);
+      //gpio_set_level(LED_GPIO, button_state == 0 ? 0 : 1); // Active low
+
+
+      if (prev_button_state != button_state) {
+        prev_button_state = button_state;
+        
+        uint8_t data2[] = {0x08, 0x00, 0x81, 0x00, 0x11, 0x51, 0x00, button_state == 0 ? 50 : 0};
+
+        int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data2, sizeof(data2), NULL, NULL);
+
+        if (rc != 0) {
+          ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
+        } else {
+          ESP_LOGI(TAG, "✅ Write successful");
+        }
+      }      
+
+      vTaskDelay(pdMS_TO_TICKS(100));
+
+    }
 }
 
