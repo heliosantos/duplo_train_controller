@@ -12,6 +12,8 @@
 #include "nvs_flash.h"
 
 static const char *TAG = "BLE_CONNECT";
+static const int MIN_ABS_THROTTLE = 40;
+static const int MAX_ABS_THROTTLE = 100;
 
 // 00001624-1212-efde-1623-785feabcd123
 static const ble_uuid128_t target_char_uuid =
@@ -175,9 +177,6 @@ void config_gpio(void) {
   btn_conf.pin_bit_mask = 1ULL << 1;
   gpio_config(&btn_conf);
 
-  btn_conf.pin_bit_mask = 1ULL << 2;
-  gpio_config(&btn_conf);
-
   // Configure LED output
   gpio_config_t led_conf = {.pin_bit_mask = 1ULL << 8,
                             .mode = GPIO_MODE_OUTPUT,
@@ -200,7 +199,6 @@ void move(int throttle) {
 }
 
 void app_main(void) {
-
   // What is this?
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -215,67 +213,51 @@ void app_main(void) {
 
   nimble_port_freertos_init(ble_host_task);
   config_gpio();
-  
-  int throttle = 0;
-  int prev_forward_button_state = 1;
-  int prev_back_button_state = 1;
+
+  int prev_throttle = 0;
+  int prev_backward_button_state = 0;
+  int prev_forward_button_state = 0;
 
   while (1) {
-    int button_state = gpio_get_level(0);
+    int forward_button_state = gpio_get_level(0) == 0 ? 1 : 0;
+    int backward_button_state = gpio_get_level(1) == 0 ? 1 : 0;
 
-    if (button_state == 0 && prev_forward_button_state == 1) {
-      if (throttle < 0) {
-        move(0);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        throttle = 0;
-      }
-
-      if (throttle < 40) {
-        throttle = 40;
-      } else {
-        throttle += 10;
-        if (throttle > 100) {
-          throttle = 100;
-        }
-      }
-
-      ESP_LOGI(TAG, "Throttle: %i", throttle);
-
-      move(throttle);
+    if ((prev_backward_button_state == backward_button_state &&
+            prev_forward_button_state == forward_button_state) ||
+        (backward_button_state == 1 && forward_button_state == 1)) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
 
-    prev_forward_button_state = button_state;
+    int throttle = prev_throttle;
 
-    if (gpio_get_level(1) == 0) {
+    ESP_LOGI(TAG, "back: %i, forward: %i", backward_button_state,
+             forward_button_state);
+
+    if ((prev_throttle < 0 && forward_button_state == 1) ||
+        (prev_throttle > 0 && backward_button_state == 1)) {
+      // stop
       throttle = 0;
-      move(0);
+    } else if (forward_button_state == 1 && throttle >= 0) {
+      if (throttle == 0) {
+        throttle = MIN_ABS_THROTTLE;
+      } else if (throttle < MAX_ABS_THROTTLE) {
+        throttle += 30;
+      }
+    } else if (backward_button_state == 1 && throttle <= 0) {
+      if (throttle == 0) {
+        throttle = -MIN_ABS_THROTTLE;
+      } else if (throttle > -MAX_ABS_THROTTLE) {
+        throttle -= 30;
+      }
     }
 
-    int back_button_state = gpio_get_level(2);
+    prev_throttle = throttle;
+    prev_forward_button_state = forward_button_state;
+    prev_backward_button_state = backward_button_state;
 
-    if (back_button_state == 0 && prev_back_button_state == 1) {
-      if (throttle > 0) {
-        move(0);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        throttle = 0;
-      }
-
-      if (throttle > -40) {
-        throttle = -40;
-      } else {
-        throttle -= 10;
-        if (throttle < -100) {
-          throttle = -100;
-        }
-      }
-
-      ESP_LOGI(TAG, "Throttle: %i", throttle);
-
-      move(throttle);
-    }
-
-    prev_back_button_state = back_button_state;
-
+    ESP_LOGI(TAG, ">>> %i, %i, %i", backward_button_state, forward_button_state,
+             throttle);
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
