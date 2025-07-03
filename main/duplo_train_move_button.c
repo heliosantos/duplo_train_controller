@@ -200,6 +200,8 @@ void move(int throttle) {
 }
 
 void app_main(void) {
+
+  // What is this?
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
       ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -213,14 +215,15 @@ void app_main(void) {
 
   nimble_port_freertos_init(ble_host_task);
   config_gpio();
+  
   int throttle = 0;
-  int prev_button_state = 1;
+  int prev_forward_button_state = 1;
   int prev_back_button_state = 1;
 
   while (1) {
     int button_state = gpio_get_level(0);
 
-    if (button_state == 0 && prev_button_state == 1) {
+    if (button_state == 0 && prev_forward_button_state == 1) {
       if (throttle < 0) {
         move(0);
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -241,7 +244,7 @@ void app_main(void) {
       move(throttle);
     }
 
-    prev_button_state = button_state;
+    prev_forward_button_state = button_state;
 
     if (gpio_get_level(1) == 0) {
       throttle = 0;
