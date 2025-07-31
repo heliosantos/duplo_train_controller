@@ -198,6 +198,45 @@ void move(int throttle) {
   if (rc != 0) ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
 }
 
+void setup() {
+  uint8_t data[] = {0x0a, 0x00, 0x41, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01};
+  int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data,
+                                sizeof(data), NULL, NULL);
+  if (rc != 0) ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
+}
+
+/*
+ *  'break': 3,
+    'start': 5,
+    'water': 7,
+    'whistle': 9,
+    'horn': 10,
+ *
+ */
+void play_sound(int soundId) {
+  uint8_t data[] = {0x08, 0x00, 0x81, 0x01, 0x11, 0x51, 0x01, soundId};
+  int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data,
+                                sizeof(data), NULL, NULL);
+  if (rc != 0) ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
+}
+
+/*
+    'NONE': 0,
+    'MAGENTA': 2,
+    'BLUE': 3,
+    'GREEN': 6,
+    'YELLOW': 7,
+    'ORANGE': 8,
+    'RED': 9,
+
+*/
+void set_color(int colorId) {
+  uint8_t data[] = {0x08, 0x00, 0x81, 0x11, 0x11, 0x51, 0x00, colorId};
+  int rc = ble_gattc_write_flat(conn_handle, char_val_handle, data,
+                                sizeof(data), NULL, NULL);
+  if (rc != 0) ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
+}
+
 void app_main(void) {
   // What is this?
   esp_err_t ret = nvs_flash_init();
@@ -223,7 +262,7 @@ void app_main(void) {
     int backward_button_state = gpio_get_level(1) == 0 ? 1 : 0;
 
     if ((prev_backward_button_state == backward_button_state &&
-            prev_forward_button_state == forward_button_state) ||
+         prev_forward_button_state == forward_button_state) ||
         (backward_button_state == 1 && forward_button_state == 1)) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -250,6 +289,30 @@ void app_main(void) {
       } else if (throttle > -MAX_ABS_THROTTLE) {
         throttle -= 30;
       }
+    }
+
+    if (prev_throttle != throttle) {
+      // int inc = prev_throttle < throttle ? 5 : -5;
+      // ESP_LOGI(TAG, "> %i - %i (%i )", prev_throttle, throttle, inc);
+      // for (int i = prev_throttle; i != throttle + inc; i += inc) {
+      //   if (i == 0 || i <= -35 || i >= 35) {
+      //     ESP_LOGI(TAG, "> %i", i);
+      //     move(i);
+      //     vTaskDelay(pdMS_TO_TICKS(10));
+      //   }
+      // }
+
+      move(throttle);
+      if (throttle > 0) {
+        set_color(6);
+      } else if (throttle < 0) {
+        set_color(9);
+      } else {
+        set_color(0);
+      }
+    } else if (throttle == MAX_ABS_THROTTLE && forward_button_state == 1) {
+      setup();
+      play_sound(10);
     }
 
     prev_throttle = throttle;
