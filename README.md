@@ -1,7 +1,7 @@
 An alternative to the Duplo mobile app for controlling Duplo trains.
 The controller is powered by a ESP32 C3 microcontroller.
 
-<img width="2978" height="2071" alt="controller" src="https://github.com/user-attachments/assets/c10b37eb-4a15-4608-b4ec-3ee505c8f1ad" />
+![controller](https://github.com/user-attachments/assets/a3a56c1d-a49e-4b01-99e0-b75228dbcf1b)
 
 ```shell
 # Requirements:
