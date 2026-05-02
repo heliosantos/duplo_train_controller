@@ -298,9 +298,9 @@ void app_main(void) {
         if (throttle != prev_throttle) {
             move(throttle);
 
-            if (throttle > 0) set_color(6);
-            else if (throttle < 0) set_color(9);
-            else set_color(0);
+            if (throttle > 0) set_color(6);       // Green
+            else if (throttle < 0) set_color(3);  // Blue
+            else set_color(9);                    // Red
 
         } else if (throttle == MAX_ABS_THROTTLE && forward) {
             setup_cmd();
