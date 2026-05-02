@@ -19,6 +19,13 @@ static const int MIN_ABS_THROTTLE = 40;
 static const int MAX_ABS_THROTTLE = 100;
 
 /* =========================
+   GPIO pins
+   ========================= */
+#define GPIO_FORWARD  GPIO_NUM_0
+#define GPIO_STOP     GPIO_NUM_1
+#define GPIO_BACKWARD GPIO_NUM_2
+
+/* =========================
    BLE target UUID
    ========================= */
 static const ble_uuid128_t target_char_uuid =
@@ -45,6 +52,50 @@ typedef struct {
 } train_cmd_t;
 
 static QueueHandle_t cmd_queue;
+
+/* =========================
+   GPIO event queue
+   ========================= */
+static QueueHandle_t gpio_evt_queue;
+
+/* =========================
+   Button state (updated by ISR task)
+   ========================= */
+static volatile int forward_pressed = 0;
+static volatile int stop_pressed = 0;
+static volatile int backward_pressed = 0;
+
+/* =========================
+   ISR
+   ========================= */
+static void IRAM_ATTR gpio_isr_handler(void *arg) {
+    uint32_t gpio_num = (uint32_t)arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+/* =========================
+   GPIO event task
+   ========================= */
+void gpio_task(void *arg) {
+    uint32_t io_num;
+
+    while (1) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+
+            int level = gpio_get_level(io_num);
+
+            if (io_num == GPIO_FORWARD) {
+                forward_pressed = (level == 0);
+            }
+            else if (io_num == GPIO_STOP) {
+                stop_pressed = (level == 0);
+            }
+            else if (io_num == GPIO_BACKWARD) {
+                backward_pressed = (level == 0);
+            }
+        }
+    }
+}
 
 /* =========================
    Queue helper
@@ -156,19 +207,18 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                 memcpy(name, fields.name, fields.name_len);
 
                 if (!device_connected && strcmp(name, "Train Base") == 0) {
+
                     ESP_LOGI(TAG, "Found Train Base, connecting...");
 
                     ble_gap_disc_cancel();
                     scanning = false;
 
-                    int rc = ble_gap_connect(own_addr_type,
-                                             &event->disc.addr,
-                                             30000,
-                                             NULL,
-                                             ble_gap_event,
-                                             NULL);
-
-                    if (rc == 0) device_connected = true;
+                    ble_gap_connect(own_addr_type,
+                                    &event->disc.addr,
+                                    30000,
+                                    NULL,
+                                    ble_gap_event,
+                                    NULL);
                 }
             }
         }
@@ -178,6 +228,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             conn_handle = event->connect.conn_handle;
+            device_connected = true;
             ble_ready = false;
 
             ESP_LOGI(TAG, "Connected!");
@@ -193,19 +244,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         device_connected = false;
         ble_ready = false;
 
-        if (!scanning) {
-            struct ble_gap_disc_params scan_params = {
-                .passive = 0,
-                .filter_duplicates = 1,
-                .itvl = 0x0010,
-                .window = 0x0010,
-            };
-
-            ble_gap_disc(own_addr_type, BLE_HS_FOREVER,
-                         &scan_params, ble_gap_event, NULL);
-
-            scanning = true;
-        }
         return 0;
 
     default:
@@ -239,45 +277,40 @@ void ble_host_task(void *param) {
 }
 
 /* =========================
-   GPIO
+   GPIO init (INTERRUPTS)
    ========================= */
 void config_gpio(void) {
-    gpio_config_t btn_conf = {
-        .pin_bit_mask = (1ULL << 0) | (1ULL << 1) | (1ULL << 2),
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << GPIO_FORWARD) |
+                        (1ULL << GPIO_STOP) |
+                        (1ULL << GPIO_BACKWARD),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_ANYEDGE
     };
-    gpio_config(&btn_conf);
+
+    gpio_config(&cfg);
+
+    gpio_install_isr_service(0);
+
+    gpio_isr_handler_add(GPIO_FORWARD, gpio_isr_handler, (void*)GPIO_FORWARD);
+    gpio_isr_handler_add(GPIO_STOP, gpio_isr_handler, (void*)GPIO_STOP);
+    gpio_isr_handler_add(GPIO_BACKWARD, gpio_isr_handler, (void*)GPIO_BACKWARD);
 }
 
 /* =========================
-   MAIN
+   MAIN CONTROL LOOP
    ========================= */
-void app_main(void) {
-
-    esp_err_t ret = nvs_flash_init();
-    if (ret != ESP_OK) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-
-    nimble_port_init();
-    ble_hs_cfg.sync_cb = ble_app_on_sync;
-
-    nimble_port_freertos_init(ble_host_task);
-
-    cmd_queue = xQueueCreate(10, sizeof(train_cmd_t));
-    xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 5, NULL);
-
-    config_gpio();
+void control_task(void *arg) {
 
     int prev_throttle = 0;
 
     while (1) {
 
-        int forward = gpio_get_level(0) == 0;
-        int stop = gpio_get_level(1) == 0;
-        int backward = gpio_get_level(2) == 0;
+        int forward = forward_pressed;
+        int stop = stop_pressed;
+        int backward = backward_pressed;
 
         int throttle = prev_throttle;
 
@@ -298,9 +331,9 @@ void app_main(void) {
         if (throttle != prev_throttle) {
             move(throttle);
 
-            if (throttle > 0) set_color(6);       // Green
-            else if (throttle < 0) set_color(3);  // Blue
-            else set_color(9);                    // Red
+            if (throttle > 0) set_color(6);
+            else if (throttle < 0) set_color(3);
+            else set_color(9);
 
         } else if (throttle == MAX_ABS_THROTTLE && forward) {
             setup_cmd();
@@ -309,6 +342,32 @@ void app_main(void) {
 
         prev_throttle = throttle;
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
+}
+
+/* =========================
+   MAIN
+   ========================= */
+void app_main(void) {
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret != ESP_OK) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    nimble_port_init();
+    ble_hs_cfg.sync_cb = ble_app_on_sync;
+
+    nimble_port_freertos_init(ble_host_task);
+
+    cmd_queue = xQueueCreate(10, sizeof(train_cmd_t));
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+
+    xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 5, NULL);
+    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 5, NULL);
+    xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
+
+    config_gpio();
 }
