@@ -29,6 +29,12 @@ static const ble_uuid128_t target_char_uuid =
     BLE_UUID128_INIT(0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x23, 0x16,
                      0xde, 0xef, 0x12, 0x12, 0x24, 0x16, 0x00, 0x00);
 
+typedef enum {
+    EVT_FORWARD,
+    EVT_STOP,
+    EVT_BACKWARD
+} control_event_t;
+
 /* =========================
    State
    ========================= */
@@ -55,44 +61,22 @@ static QueueHandle_t cmd_queue;
    ========================= */
 static QueueHandle_t gpio_evt_queue;
 
-/* =========================
-   Button state (updated by ISR task)
-   ========================= */
-static volatile int forward_pressed = 0;
-static volatile int stop_pressed = 0;
-static volatile int backward_pressed = 0;
 
 /* =========================
    ISR
    ========================= */
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
     uint32_t gpio_num = (uint32_t)arg;
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+
+    control_event_t evt;
+
+    if (gpio_num == GPIO_FORWARD) evt = EVT_FORWARD;
+    else if (gpio_num == GPIO_STOP) evt = EVT_STOP;
+    else evt = EVT_BACKWARD;
+
+    xQueueSendFromISR(gpio_evt_queue, &evt, NULL);
 }
 
-/* =========================
-   GPIO event task
-   ========================= */
-void gpio_task(void *arg) {
-    uint32_t io_num;
-
-    while (1) {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-
-            int level = gpio_get_level(io_num);
-
-            if (io_num == GPIO_FORWARD) {
-                forward_pressed = (level == 0);
-            }
-            else if (io_num == GPIO_STOP) {
-                stop_pressed = (level == 0);
-            }
-            else if (io_num == GPIO_BACKWARD) {
-                backward_pressed = (level == 0);
-            }
-        }
-    }
-}
 
 /* =========================
    Queue helper
@@ -314,56 +298,54 @@ int speed_to_throttle(int speed) {
    ========================= */
 void control_task(void *arg) {
 
+    control_event_t evt;
+    int speed = 0;
     int prev_speed = 0;
 
     while (1) {
 
-        int forward = forward_pressed;
-        int stop = stop_pressed;
-        int backward = backward_pressed;
+        if (xQueueReceive(gpio_evt_queue, &evt, portMAX_DELAY)) {
 
-        int speed = prev_speed;
+            switch (evt) {
 
-        /* =========================
-           Speed control (discrete)
-           ========================= */
+            case EVT_FORWARD:
+                speed = (speed < 3) ? speed + 1 : speed;
+                break;
 
-        if (forward && !stop && !backward) {
-            if (speed < 3) speed++;
+            case EVT_STOP:
+                speed = 0;
+                break;
 
-        } else if (!forward && stop && !backward) {
-            speed = 0;
+            case EVT_BACKWARD:
+                speed = (speed > -3) ? speed - 1 : speed;
+                break;
+            }
 
-        } else if (!forward && !stop && backward) {
-            if (speed > -3) speed--;
+            if (speed != prev_speed) {
+
+                int throttle = speed_to_throttle(speed);
+
+                ESP_LOGI(TAG, "Speed: %d -> Throttle: %d", speed, throttle);
+
+                move(throttle);
+
+                if (speed > 0) set_color(6);
+                else if (speed < 0) set_color(3);
+                else set_color(9);
+            }
+
+            if (speed == 3 && evt == EVT_FORWARD) {
+                setup_cmd();
+                play_sound(10);
+            }
+
+            prev_speed = speed;
+
+            // drain remaining queued events
+            vTaskDelay(pdMS_TO_TICKS(250));
+            xQueueReset(gpio_evt_queue);
+
         }
-
-        /* =========================
-           Apply change
-           ========================= */
-
-        if (speed != prev_speed) {
-
-            int throttle = speed_to_throttle(speed);
-
-            ESP_LOGI(TAG, "Speed: %d -> Throttle: %d", speed, throttle);
-
-            move(throttle);
-
-            if (speed > 0) set_color(6);       // Green
-            else if (speed < 0) set_color(3);  // Blue
-            else set_color(9);                 // Red
-        }
-
-        /* Max speed action */
-        else if (speed == 3 && forward) {
-            setup_cmd();
-            play_sound(10);
-        }
-
-        prev_speed = speed;
-
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -387,7 +369,6 @@ void app_main(void) {
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
 
     xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 5, NULL);
-    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 5, NULL);
     xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
 
     config_gpio();
