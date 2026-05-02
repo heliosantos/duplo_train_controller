@@ -15,9 +15,6 @@
 
 static const char *TAG = "BLE_CONNECT";
 
-static const int MIN_ABS_THROTTLE = 40;
-static const int MAX_ABS_THROTTLE = 100;
-
 /* =========================
    GPIO pins
    ========================= */
@@ -299,12 +296,25 @@ void config_gpio(void) {
     gpio_isr_handler_add(GPIO_BACKWARD, gpio_isr_handler, (void*)GPIO_BACKWARD);
 }
 
+int speed_to_throttle(int speed) {
+    switch (speed) {
+        case -3: return -100;
+        case -2: return -70;
+        case -1: return -40;
+        case  0: return 0;
+        case  1: return 40;
+        case  2: return 70;
+        case  3: return 100;
+        default: return 0;
+    }
+}
+
 /* =========================
    MAIN CONTROL LOOP
    ========================= */
 void control_task(void *arg) {
 
-    int prev_throttle = 0;
+    int prev_speed = 0;
 
     while (1) {
 
@@ -312,35 +322,46 @@ void control_task(void *arg) {
         int stop = stop_pressed;
         int backward = backward_pressed;
 
-        int throttle = prev_throttle;
+        int speed = prev_speed;
+
+        /* =========================
+           Speed control (discrete)
+           ========================= */
 
         if (forward && !stop && !backward) {
-            if (throttle == 0) throttle = MIN_ABS_THROTTLE;
-            else if (throttle < MAX_ABS_THROTTLE) throttle += 30;
+            if (speed < 3) speed++;
 
         } else if (!forward && stop && !backward) {
-            throttle = 0;
+            speed = 0;
 
         } else if (!forward && !stop && backward) {
-            if (throttle == 0) throttle = -MIN_ABS_THROTTLE;
-            else if (throttle > -MAX_ABS_THROTTLE) throttle -= 30;
+            if (speed > -3) speed--;
         }
 
-        if (abs(throttle) < MIN_ABS_THROTTLE) throttle = 0;
+        /* =========================
+           Apply change
+           ========================= */
 
-        if (throttle != prev_throttle) {
+        if (speed != prev_speed) {
+
+            int throttle = speed_to_throttle(speed);
+
+            ESP_LOGI(TAG, "Speed: %d -> Throttle: %d", speed, throttle);
+
             move(throttle);
 
-            if (throttle > 0) set_color(6);
-            else if (throttle < 0) set_color(3);
-            else set_color(9);
+            if (speed > 0) set_color(6);       // Green
+            else if (speed < 0) set_color(3);  // Blue
+            else set_color(9);                 // Red
+        }
 
-        } else if (throttle == MAX_ABS_THROTTLE && forward) {
+        /* Max speed action */
+        else if (speed == 3 && forward) {
             setup_cmd();
             play_sound(10);
         }
 
-        prev_throttle = throttle;
+        prev_speed = speed;
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
