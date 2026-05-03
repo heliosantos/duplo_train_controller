@@ -151,9 +151,21 @@ void enable_speed_notifications() {
    ========================= */
 void process_speed_change(uint8_t *payload, int len) {
     if (len < 2) return;
-
+    control_event_t evt;
     int16_t speed = payload[0] | (payload[1] << 8);
     ESP_LOGI("Train", "Speed: %d", speed);
+    if (speed == 0) {
+        evt = EVT_STOP;
+        xQueueSendFromISR(gpio_evt_queue, &evt, NULL);
+    }
+
+    if (speed > 0) {
+        set_color(6);
+    } else if (speed < 0) {
+        set_color(3);
+    } else {
+        set_color(9);
+    }
 }
 
 void parse_message(uint8_t *data, int len) {
@@ -392,9 +404,13 @@ void control_task(void *arg) {
 
                 move(throttle_perc);
 
-                if (throttle > 0) set_color(6);
-                else if (throttle < 0) set_color(3);
-                else set_color(9);
+                // if (throttle > 0) {
+                //     set_color(6);
+                // } else if (throttle < 0) {
+                //     set_color(3);
+                // } else {
+                //     set_color(9);
+                // }
             }
 
             if (prev_throttle == 3 && throttle == 3 && evt == EVT_FORWARD) {
