@@ -13,7 +13,10 @@
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
 
-static const char *TAG = "BLE_CONNECT";
+/* =========================
+   Forward declarations (FIX)
+   ========================= */
+void ble_app_on_sync(void);
 
 /* =========================
    GPIO pins
@@ -29,6 +32,9 @@ static const ble_uuid128_t target_char_uuid =
     BLE_UUID128_INIT(0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x23, 0x16,
                      0xde, 0xef, 0x12, 0x12, 0x24, 0x16, 0x00, 0x00);
 
+/* ========================= */
+#define MSG_PORT_VALUE_SINGLE 0x45
+
 typedef enum {
     EVT_FORWARD,
     EVT_STOP,
@@ -40,11 +46,11 @@ typedef enum {
    ========================= */
 static bool device_connected = false;
 static bool ble_ready = false;
-static bool scanning = false;
 
 static uint8_t own_addr_type;
 static uint16_t conn_handle;
 static uint16_t char_val_handle;
+static uint16_t ccc_handle;
 
 /* =========================
    Command queue
@@ -55,12 +61,7 @@ typedef struct {
 } train_cmd_t;
 
 static QueueHandle_t cmd_queue;
-
-/* =========================
-   GPIO event queue
-   ========================= */
 static QueueHandle_t gpio_evt_queue;
-
 
 /* =========================
    ISR
@@ -77,7 +78,6 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
     xQueueSendFromISR(gpio_evt_queue, &evt, NULL);
 }
 
-
 /* =========================
    Queue helper
    ========================= */
@@ -87,7 +87,7 @@ void enqueue_command(uint8_t *data, uint8_t len) {
     cmd.len = len;
 
     if (xQueueSend(cmd_queue, &cmd, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Queue full, dropping command");
+        ESP_LOGW("Queue", "Queue full, dropping command");
     }
 }
 
@@ -101,11 +101,10 @@ void ble_tx_task(void *param) {
         if (xQueueReceive(cmd_queue, &cmd, portMAX_DELAY)) {
 
             if (!device_connected || !ble_ready) {
-                ESP_LOGW(TAG, "BLE not ready, dropping command");
                 continue;
             }
 
-            int rc = ble_gattc_write_flat(
+            ble_gattc_write_flat(
                 conn_handle,
                 char_val_handle,
                 cmd.data,
@@ -113,16 +112,12 @@ void ble_tx_task(void *param) {
                 NULL,
                 NULL
             );
-
-            if (rc != 0) {
-                ESP_LOGE(TAG, "❌ Failed to write: %d", rc);
-            }
         }
     }
 }
 
 /* =========================
-   Command wrappers
+   Commands
    ========================= */
 void move(int throttle) {
     if (throttle < 0) throttle = 256 + throttle;
@@ -146,20 +141,80 @@ void set_color(int colorId) {
     enqueue_command(data, sizeof(data));
 }
 
+void enable_speed_notifications() {
+    uint8_t data[] = {0x0a, 0x00, 0x41, 0x13, 0x00, 0x50, 0x00, 0x00, 0x00, 0x01};
+    enqueue_command(data, sizeof(data));
+}
+
 /* =========================
-   BLE discovery
+   Notify parsing
+   ========================= */
+void process_speed_change(uint8_t *payload, int len) {
+    if (len < 2) return;
+
+    int16_t speed = payload[0] | (payload[1] << 8);
+    ESP_LOGI("Train", "Speed: %d", speed);
+}
+
+void parse_message(uint8_t *data, int len) {
+    if (len < 5) return;
+
+    if (data[2] == MSG_PORT_VALUE_SINGLE && data[3] == 0x13) {
+        process_speed_change(&data[4], len - 4);
+    }
+}
+
+/* =========================
+   Descriptor discovery
+   ========================= */
+static int dsc_cb(uint16_t conn_handle,
+                  const struct ble_gatt_error *error,
+                  uint16_t chr_val_handle,
+                  const struct ble_gatt_dsc *dsc,
+                  void *arg) {
+
+    if (error->status == 0 && ble_uuid_u16(&dsc->uuid.u) == 0x2902) {
+
+        ccc_handle = dsc->handle;
+
+        uint8_t enable_notify[2] = {0x01, 0x00};
+
+        ble_gattc_write_flat(conn_handle,
+                             ccc_handle,
+                             enable_notify,
+                             sizeof(enable_notify),
+                             NULL,
+                             NULL);
+
+        ESP_LOGI("BLE", "🔔 Notifications enabled");
+
+        enable_speed_notifications();
+    }
+
+    return 0;
+}
+
+/* =========================
+   Characteristic discovery
    ========================= */
 static int discover_cb(uint16_t conn_handle,
                        const struct ble_gatt_error *error,
                        const struct ble_gatt_chr *chr,
                        void *arg) {
 
-    if (error->status == 0) {
-        if (ble_uuid_cmp(&chr->uuid.u, &target_char_uuid.u) == 0) {
-            char_val_handle = chr->val_handle;
-            ble_ready = true;
-            ESP_LOGI(TAG, "🎯 Characteristic found, ready!");
-        }
+    if (error->status == 0 &&
+        ble_uuid_cmp(&chr->uuid.u, &target_char_uuid.u) == 0) {
+
+        char_val_handle = chr->val_handle;
+        ble_ready = true;
+
+        ESP_LOGI("BLE", "🎯 Characteristic found");
+
+        ble_gattc_disc_all_dscs(conn_handle,
+                                chr->val_handle,
+                                0xffff,
+                                dsc_cb,
+                                NULL);
     }
 
     return 0;
@@ -184,15 +239,15 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                                    event->disc.length_data) == 0) {
 
             if (fields.name && fields.name_len > 0) {
-                char name[32] = {0};
-                memcpy(name, fields.name, fields.name_len);
+
+                char name[32];
+                int len = fields.name_len < 31 ? fields.name_len : 31;
+                memcpy(name, fields.name, len);
+                name[len] = '\0';
 
                 if (!device_connected && strcmp(name, "Train Base") == 0) {
 
-                    ESP_LOGI(TAG, "Found Train Base, connecting...");
-
                     ble_gap_disc_cancel();
-                    scanning = false;
 
                     ble_gap_connect(own_addr_type,
                                     &event->disc.addr,
@@ -212,20 +267,32 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             device_connected = true;
             ble_ready = false;
 
-            ESP_LOGI(TAG, "Connected!");
+            ESP_LOGI("BLE", "Connected!");
             discover_characteristics();
-        } else {
-            device_connected = false;
         }
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "Disconnected");
+        ESP_LOGI("BLE", "Disconnected");
 
         device_connected = false;
         ble_ready = false;
 
+        ble_app_on_sync();  // reconnect
+
         return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        struct os_mbuf *om = event->notify_rx.om;
+
+        uint8_t data[64];
+        int len = OS_MBUF_PKTLEN(om);
+
+        os_mbuf_copydata(om, 0, len, data);
+
+        parse_message(data, len);
+        return 0;
+    }
 
     default:
         return 0;
@@ -236,20 +303,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
    BLE init
    ========================= */
 void ble_app_on_sync(void) {
-    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    assert(rc == 0);
+    ble_hs_id_infer_auto(0, &own_addr_type);
 
     struct ble_gap_disc_params scan_params = {
         .passive = 0,
-        .filter_duplicates = 1,
-        .itvl = 0x0010,
-        .window = 0x0010,
+        .itvl = 0x10,
+        .window = 0x10,
     };
 
     ble_gap_disc(own_addr_type, BLE_HS_FOREVER,
                  &scan_params, ble_gap_event, NULL);
-
-    scanning = true;
 }
 
 void ble_host_task(void *param) {
@@ -258,7 +321,7 @@ void ble_host_task(void *param) {
 }
 
 /* =========================
-   GPIO init (INTERRUPTS)
+   GPIO init
    ========================= */
 void config_gpio(void) {
 
@@ -280,7 +343,7 @@ void config_gpio(void) {
     gpio_isr_handler_add(GPIO_BACKWARD, gpio_isr_handler, (void*)GPIO_BACKWARD);
 }
 
-int speed_to_throttle(int speed) {
+int throttle_to_perc(int speed) {
     switch (speed) {
         case -3: return -100;
         case -2: return -70;
@@ -294,13 +357,13 @@ int speed_to_throttle(int speed) {
 }
 
 /* =========================
-   MAIN CONTROL LOOP
+   Control task
    ========================= */
 void control_task(void *arg) {
 
     control_event_t evt;
-    int speed = 0;
-    int prev_speed = 0;
+    int throttle = 0;
+    int prev_throttle = 0;
 
     while (1) {
 
@@ -309,37 +372,37 @@ void control_task(void *arg) {
             switch (evt) {
 
             case EVT_FORWARD:
-                speed = (speed < 3) ? speed + 1 : speed;
+                throttle = (throttle < 3) ? throttle + 1 : throttle;
                 break;
 
             case EVT_STOP:
-                speed = 0;
+                throttle = 0;
                 break;
 
             case EVT_BACKWARD:
-                speed = (speed > -3) ? speed - 1 : speed;
+                throttle = (throttle > -3) ? throttle - 1 : throttle;
                 break;
             }
 
-            if (speed != prev_speed) {
+            if (throttle != prev_throttle) {
 
-                int throttle = speed_to_throttle(speed);
+                int throttle_perc = throttle_to_perc(throttle);
 
-                ESP_LOGI(TAG, "Speed: %d -> Throttle: %d", speed, throttle);
+                ESP_LOGI("Train", "throttle: %d (%d%)", throttle, throttle_perc);
 
-                move(throttle);
+                move(throttle_perc);
 
-                if (speed > 0) set_color(6);
-                else if (speed < 0) set_color(3);
+                if (throttle > 0) set_color(6);
+                else if (throttle < 0) set_color(3);
                 else set_color(9);
             }
 
-            if (speed == 3 && evt == EVT_FORWARD) {
+            if (prev_throttle == 3 && throttle == 3 && evt == EVT_FORWARD) {
                 setup_cmd();
                 play_sound(10);
             }
 
-            prev_speed = speed;
+            prev_throttle = throttle;
 
             // drain remaining queued events
             vTaskDelay(pdMS_TO_TICKS(250));
@@ -354,11 +417,7 @@ void control_task(void *arg) {
    ========================= */
 void app_main(void) {
 
-    esp_err_t ret = nvs_flash_init();
-    if (ret != ESP_OK) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    nvs_flash_init();
 
     nimble_port_init();
     ble_hs_cfg.sync_cb = ble_app_on_sync;
@@ -366,10 +425,10 @@ void app_main(void) {
     nimble_port_freertos_init(ble_host_task);
 
     cmd_queue = xQueueCreate(10, sizeof(train_cmd_t));
-    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    gpio_evt_queue = xQueueCreate(10, sizeof(control_event_t));
 
     xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 5, NULL);
-    xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
+    xTaskCreate(control_task, "control", 4096, NULL, 5, NULL);
 
     config_gpio();
 }
