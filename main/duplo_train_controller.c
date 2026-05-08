@@ -12,6 +12,25 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
+#include "freertos/semphr.h"
+
+static SemaphoreHandle_t ble_write_sem;
+
+int throttle = 0;
+int prev_throttle = 0;
+int resume_throttle = 0;
+
+int lights_on = 1;
+int current_led_color = 0;
+
+static int ble_write_cb(uint16_t conn_handle,
+                        const struct ble_gatt_error *error,
+                        struct ble_gatt_attr *attr,
+                        void *arg) {
+
+    xSemaphoreGive(ble_write_sem);
+    return 0;
+}
 
 /* =========================
    Forward declarations (FIX)
@@ -28,9 +47,7 @@ void ble_app_on_sync(void);
 /* =========================
    BLE target UUID
    ========================= */
-static const ble_uuid128_t target_char_uuid =
-    BLE_UUID128_INIT(0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x23, 0x16,
-                     0xde, 0xef, 0x12, 0x12, 0x24, 0x16, 0x00, 0x00);
+static const ble_uuid128_t target_char_uuid = BLE_UUID128_INIT(0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x23, 0x16, 0xde, 0xef, 0x12, 0x12, 0x24, 0x16, 0x00, 0x00);
 
 /* ========================= */
 #define MSG_PORT_VALUE_SINGLE 0x45
@@ -38,7 +55,8 @@ static const ble_uuid128_t target_char_uuid =
 typedef enum {
     EVT_FORWARD,
     EVT_STOP,
-    EVT_BACKWARD
+    EVT_BACKWARD,
+    EVT_RESUME
 } control_event_t;
 
 /* =========================
@@ -61,21 +79,45 @@ typedef struct {
 } train_cmd_t;
 
 static QueueHandle_t cmd_queue;
-static QueueHandle_t gpio_evt_queue;
+static QueueHandle_t movement_evt_queue;
+static QueueHandle_t color_action_queue;
 
-/* =========================
-   ISR
-   ========================= */
-static void IRAM_ATTR gpio_isr_handler(void *arg) {
+static TickType_t last_forward_tick = 0;
+static TickType_t last_stop_tick = 0;
+static TickType_t last_backward_tick = 0;
+
+#define BUTTON_DEBOUNCE_MS 250
+
+static void IRAM_ATTR gpio_isr_handler(void *arg)
+{
     uint32_t gpio_num = (uint32_t)arg;
 
+    TickType_t now = xTaskGetTickCountFromISR();
+
     control_event_t evt;
+    TickType_t *last_tick = NULL;
 
-    if (gpio_num == GPIO_FORWARD) evt = EVT_FORWARD;
-    else if (gpio_num == GPIO_STOP) evt = EVT_STOP;
-    else evt = EVT_BACKWARD;
+    if (gpio_num == GPIO_FORWARD) {
+        evt = EVT_FORWARD;
+        last_tick = &last_forward_tick;
+    }
+    else if (gpio_num == GPIO_STOP) {
+        evt = EVT_STOP;
+        last_tick = &last_stop_tick;
+    }
+    else {
+        evt = EVT_BACKWARD;
+        last_tick = &last_backward_tick;
+    }
 
-    xQueueSendFromISR(gpio_evt_queue, &evt, NULL);
+    if ((now - *last_tick) * portTICK_PERIOD_MS
+            < BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+
+    *last_tick = now;
+
+    xQueueSendFromISR(movement_evt_queue, &evt, NULL);
 }
 
 /* =========================
@@ -104,12 +146,14 @@ void ble_tx_task(void *param) {
                 continue;
             }
 
+            xSemaphoreTake(ble_write_sem, portMAX_DELAY);
+
             ble_gattc_write_flat(
                 conn_handle,
                 char_val_handle,
                 cmd.data,
                 cmd.len,
-                NULL,
+                ble_write_cb,
                 NULL
             );
         }
@@ -126,23 +170,73 @@ void move(int throttle) {
     enqueue_command(data, sizeof(data));
 }
 
-void setup_cmd() {
-    uint8_t data[] = {0x0a, 0x00, 0x41, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01};
+
+int beeper_mode = 0;
+void set_beeper_mode(int mode) {
+    uint8_t data[] = {0x0a, 0x00, 0x41, 0x01, mode, 0x01, 0x00, 0x00, 0x00, 0x01};
     enqueue_command(data, sizeof(data));
 }
 
-void play_sound(int soundId) {
+void set_beeper_tone_mode() {
+    if (beeper_mode == 0) return;
+    beeper_mode = 0;
+    set_beeper_mode(beeper_mode);
+}
+
+void set_beeper_sound_mode() {
+    if (beeper_mode == 1) return;
+    beeper_mode = 1;
+    set_beeper_mode(beeper_mode);
+}
+
+
+/*
+    break: 3
+    start: 5
+    water: 7
+    whistle: 9
+    horn: 10
+*/
+void beeper_play_tone(int soundId) {
+    set_beeper_tone_mode();
+    uint8_t data[] = {0x08, 0x00, 0x81, 0x01, 0x11, 0x51, 0x0, soundId};
+    enqueue_command(data, sizeof(data));
+}
+
+/*
+    3: LOW 
+    9: MED
+    10: HIGH
+*/
+void beeper_play_sound(int soundId) {
+    set_beeper_sound_mode();
     uint8_t data[] = {0x08, 0x00, 0x81, 0x01, 0x11, 0x51, 0x01, soundId};
     enqueue_command(data, sizeof(data));
 }
 
+/*
+    NONE: 0,
+    MAGENTA: 2,
+    BLUE: 3,
+    GREEN: 6,
+    YELLOW: 7,
+    ORANGE: 8,
+    RED: 9,
+*/
 void set_color(int colorId) {
-    uint8_t data[] = {0x08, 0x00, 0x81, 0x11, 0x11, 0x51, 0x00, colorId};
+    current_led_color = colorId;
+    int color = lights_on ? current_led_color : 0;
+    uint8_t data[] = {0x08, 0x00, 0x81, 0x11, 0x11, 0x51, 0x00, color};
     enqueue_command(data, sizeof(data));
 }
 
 void enable_speed_notifications() {
     uint8_t data[] = {0x0a, 0x00, 0x41, 0x13, 0x00, 0x50, 0x00, 0x00, 0x00, 0x01};
+    enqueue_command(data, sizeof(data));
+}
+
+void enable_color_sensor_notifications() {
+    uint8_t data[] = {0x0a, 0x00, 0x41, 0x12, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01};
     enqueue_command(data, sizeof(data));
 }
 
@@ -156,7 +250,7 @@ void process_speed_change(uint8_t *payload, int len) {
     ESP_LOGI("Train", "Speed: %d", speed);
     if (speed == 0) {
         evt = EVT_STOP;
-        xQueueSendFromISR(gpio_evt_queue, &evt, NULL);
+        xQueueSend(movement_evt_queue, &evt, 0);
     }
 
     if (speed > 0) {
@@ -168,11 +262,209 @@ void process_speed_change(uint8_t *payload, int len) {
     }
 }
 
+/* =========================
+   Color-action state
+   ========================= */
+
+/* =========================
+   Color sensor cooldowns (ms)
+   ========================= */
+#define COOLDOWN_RED_MS    2000
+#define COOLDOWN_YELLOW_MS 2000
+#define COOLDOWN_GREEN_MS  2000
+#define COOLDOWN_BLUE_MS   2000
+#define COOLDOWN_WHITE_MS  2000
+
+static TickType_t last_red_tick    = 0;
+static TickType_t last_yellow_tick = 0;
+static TickType_t last_green_tick  = 0;
+static TickType_t last_blue_tick   = 0;
+static TickType_t last_white_tick  = 0;
+
+#define IS_COOLING_DOWN(last_tick, cooldown_ms) \
+    ((xTaskGetTickCount() - (last_tick)) * portTICK_PERIOD_MS < (cooldown_ms))
+
+/* =========================
+   Color action queue
+   ========================= */
+
+typedef enum {
+    COLOR_ACTION_RED,
+    COLOR_ACTION_YELLOW,
+    COLOR_ACTION_GREEN,
+    COLOR_ACTION_BLUE,
+    COLOR_ACTION_WHITE
+} color_action_t;
+
+static QueueHandle_t color_action_queue;
+
+
+/* =========================
+   Color action task
+   ========================= */
+
+void color_action_task(void *arg)
+{
+    color_action_t action;
+
+    while (1) {
+
+        if (xQueueReceive(color_action_queue,
+                          &action,
+                          portMAX_DELAY)) {
+
+            switch (action) {
+
+            case COLOR_ACTION_RED:
+
+                ESP_LOGI("COLOR", "RED → stop");
+
+                xQueueSend(
+                    movement_evt_queue,
+                    &(control_event_t){EVT_STOP},
+                    0
+                );
+
+                beeper_play_sound(3);
+
+                break;
+
+            case COLOR_ACTION_YELLOW:
+
+                ESP_LOGI("COLOR", "YELLOW → horn");
+
+                beeper_play_sound(10);
+
+                break;
+
+            case COLOR_ACTION_GREEN:
+
+                ESP_LOGI("COLOR", "GREEN → reverse");
+
+                resume_throttle = -throttle;
+
+                xQueueSend(
+                    movement_evt_queue,
+                    &(control_event_t){EVT_STOP},
+                    0
+                );
+
+                beeper_play_sound(3);
+
+                vTaskDelay(pdMS_TO_TICKS(1000));
+
+                xQueueSend(
+                    movement_evt_queue,
+                    &(control_event_t){EVT_RESUME},
+                    0
+                );
+
+                // vTaskDelay(pdMS_TO_TICKS(50));
+
+                beeper_play_sound(10);
+
+                break;
+
+            case COLOR_ACTION_BLUE:
+
+                ESP_LOGI("COLOR", "BLUE → refuel");
+
+                resume_throttle = throttle;
+
+                xQueueSend(
+                    movement_evt_queue,
+                    &(control_event_t){EVT_STOP},
+                    0
+                );
+
+                // vTaskDelay(pdMS_TO_TICKS(50));
+
+                beeper_play_sound(3);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                beeper_play_sound(7);
+                vTaskDelay(pdMS_TO_TICKS(1100));
+                beeper_play_sound(7);
+                vTaskDelay(pdMS_TO_TICKS(1100));
+                beeper_play_sound(7);
+                vTaskDelay(pdMS_TO_TICKS(1100));
+                beeper_play_sound(7);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+
+                // vTaskDelay(pdMS_TO_TICKS(3000));
+
+                xQueueSend(
+                    movement_evt_queue,
+                    &(control_event_t){EVT_RESUME},
+                    0
+                );
+
+                break;
+
+            case COLOR_ACTION_WHITE:
+                lights_on = lights_on == 1 ? 0 : 1;
+                set_color(current_led_color);
+                beeper_play_tone(3);
+                break;
+            }
+        }
+    }
+}
+
+
+/* =========================
+   Color sensor processing
+   ========================= */
+
+void process_color_sensor(uint8_t *payload, int len)
+{
+    uint8_t c = payload[len - 1];
+
+    switch (c) {
+
+        case 0x09: // RED
+            if (IS_COOLING_DOWN(last_red_tick, COOLDOWN_RED_MS)) return;
+            last_red_tick = xTaskGetTickCount();
+            xQueueSend(color_action_queue, &(color_action_t){COLOR_ACTION_RED}, 0);
+            break;
+
+        case 0x07: // YELLOW
+            if (IS_COOLING_DOWN(last_yellow_tick, COOLDOWN_YELLOW_MS)) return;
+            last_yellow_tick = xTaskGetTickCount();
+            xQueueSend(color_action_queue, &(color_action_t){COLOR_ACTION_YELLOW}, 0);
+            break;
+
+        case 0x05: // GREEN
+            if (IS_COOLING_DOWN(last_green_tick, COOLDOWN_GREEN_MS)) return;
+            last_green_tick = xTaskGetTickCount();
+            xQueueSend(color_action_queue, &(color_action_t){COLOR_ACTION_GREEN}, 0);
+            break;
+
+        case 0x03: // BLUE
+            if (IS_COOLING_DOWN(last_blue_tick, COOLDOWN_BLUE_MS)) return;
+            last_blue_tick = xTaskGetTickCount();
+            xQueueSend(color_action_queue, &(color_action_t){COLOR_ACTION_BLUE}, 0);
+            break;
+
+        case 0x0A: // WHITE
+            if (IS_COOLING_DOWN(last_white_tick, COOLDOWN_WHITE_MS)) return;
+            last_white_tick = xTaskGetTickCount();
+            xQueueSend(color_action_queue, &(color_action_t){COLOR_ACTION_WHITE}, 0);
+            break;
+
+        default:
+            break;
+    }
+}
+
 void parse_message(uint8_t *data, int len) {
     if (len < 5) return;
 
     if (data[2] == MSG_PORT_VALUE_SINGLE && data[3] == 0x13) {
         process_speed_change(&data[4], len - 4);
+    } else if (data[2] == MSG_PORT_VALUE_SINGLE && data[3] == 0x12) {
+        process_color_sensor(&data[4], len - 4);
+    } else {
+        // ESP_LOG_BUFFER_HEX("NOT FOUND", data, len);
     }
 }
 
@@ -186,21 +478,12 @@ static int dsc_cb(uint16_t conn_handle,
                   void *arg) {
 
     if (error->status == 0 && ble_uuid_u16(&dsc->uuid.u) == 0x2902) {
-
         ccc_handle = dsc->handle;
-
         uint8_t enable_notify[2] = {0x01, 0x00};
-
-        ble_gattc_write_flat(conn_handle,
-                             ccc_handle,
-                             enable_notify,
-                             sizeof(enable_notify),
-                             NULL,
-                             NULL);
-
-        ESP_LOGI("BLE", "🔔 Notifications enabled");
-
+        ble_gattc_write_flat(conn_handle, ccc_handle, enable_notify, sizeof(enable_notify), NULL, NULL);
+        // ESP_LOGI("BLE", "🔔 Notifications enabled");
         enable_speed_notifications();
+        enable_color_sensor_notifications();
     }
 
     return 0;
@@ -220,13 +503,9 @@ static int discover_cb(uint16_t conn_handle,
         char_val_handle = chr->val_handle;
         ble_ready = true;
 
-        ESP_LOGI("BLE", "🎯 Characteristic found");
+        // ESP_LOGI("BLE", "🎯 Characteristic found");
 
-        ble_gattc_disc_all_dscs(conn_handle,
-                                chr->val_handle,
-                                0xffff,
-                                dsc_cb,
-                                NULL);
+        ble_gattc_disc_all_dscs(conn_handle, chr->val_handle, 0xffff, dsc_cb, NULL);
     }
 
     return 0;
@@ -246,27 +525,17 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_DISC: {
         struct ble_hs_adv_fields fields;
 
-        if (ble_hs_adv_parse_fields(&fields,
-                                   event->disc.data,
-                                   event->disc.length_data) == 0) {
+        if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
 
             if (fields.name && fields.name_len > 0) {
-
                 char name[32];
                 int len = fields.name_len < 31 ? fields.name_len : 31;
                 memcpy(name, fields.name, len);
                 name[len] = '\0';
 
                 if (!device_connected && strcmp(name, "Train Base") == 0) {
-
                     ble_gap_disc_cancel();
-
-                    ble_gap_connect(own_addr_type,
-                                    &event->disc.addr,
-                                    30000,
-                                    NULL,
-                                    ble_gap_event,
-                                    NULL);
+                    ble_gap_connect(own_addr_type, &event->disc.addr, 30000, NULL, ble_gap_event, NULL);
                 }
             }
         }
@@ -374,26 +643,28 @@ int throttle_to_perc(int speed) {
 void control_task(void *arg) {
 
     control_event_t evt;
-    int throttle = 0;
-    int prev_throttle = 0;
 
     while (1) {
 
-        if (xQueueReceive(gpio_evt_queue, &evt, portMAX_DELAY)) {
+        if (xQueueReceive(movement_evt_queue, &evt, portMAX_DELAY)) {
 
             switch (evt) {
 
-            case EVT_FORWARD:
-                throttle = (throttle < 3) ? throttle + 1 : throttle;
-                break;
+                case EVT_FORWARD:
+                    throttle = (throttle < 3) ? throttle + 1 : throttle;
+                    break;
 
-            case EVT_STOP:
-                throttle = 0;
-                break;
+                case EVT_STOP:
+                    throttle = 0;
+                    break;
 
-            case EVT_BACKWARD:
-                throttle = (throttle > -3) ? throttle - 1 : throttle;
-                break;
+                case EVT_BACKWARD:
+                    throttle = (throttle > -3) ? throttle - 1 : throttle;
+                    break;
+                case EVT_RESUME:
+                    prev_throttle = throttle;
+                    throttle = resume_throttle;
+                    break;
             }
 
             if (throttle != prev_throttle) {
@@ -403,26 +674,13 @@ void control_task(void *arg) {
                 ESP_LOGI("Train", "throttle: %d (%d%)", throttle, throttle_perc);
 
                 move(throttle_perc);
-
-                // if (throttle > 0) {
-                //     set_color(6);
-                // } else if (throttle < 0) {
-                //     set_color(3);
-                // } else {
-                //     set_color(9);
-                // }
             }
 
             if (prev_throttle == 3 && throttle == 3 && evt == EVT_FORWARD) {
-                setup_cmd();
-                play_sound(10);
+                beeper_play_sound(10);
             }
 
             prev_throttle = throttle;
-
-            // drain remaining queued events
-            vTaskDelay(pdMS_TO_TICKS(250));
-            xQueueReset(gpio_evt_queue);
 
         }
     }
@@ -441,10 +699,15 @@ void app_main(void) {
     nimble_port_freertos_init(ble_host_task);
 
     cmd_queue = xQueueCreate(10, sizeof(train_cmd_t));
-    gpio_evt_queue = xQueueCreate(10, sizeof(control_event_t));
+    movement_evt_queue = xQueueCreate(10, sizeof(control_event_t));
+    color_action_queue = xQueueCreate(10, sizeof(color_action_t));
+
+    ble_write_sem = xSemaphoreCreateBinary();
+    xSemaphoreGive(ble_write_sem);
 
     xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 5, NULL);
     xTaskCreate(control_task, "control", 4096, NULL, 5, NULL);
+    xTaskCreate(color_action_task, "color_action", 4096, NULL, 5, NULL);
 
     config_gpio();
 }
