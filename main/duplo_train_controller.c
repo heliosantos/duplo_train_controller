@@ -309,17 +309,13 @@ void process_speed_change(uint8_t *payload, int len) {
     int16_t speed = payload[0] | (payload[1] << 8);
     ESP_LOGI("Train", "Speed: %d", speed);
 
-    control_event_t evt;
-    if (speed == 0) {
-        evt = EVT_STOP;
-        xQueueSend(movement_evt_queue, &evt, 0);
-    }
-
     if (speed > 0) {
         set_color(6);
     } else if (speed < 0) {
         set_color(3);
     } else {
+        // xQueueSend(movement_evt_queue, &(control_event_t){EVT_STOP}, 0);
+        throttle = 0;
         set_color(9);
     }
 }
