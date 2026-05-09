@@ -284,7 +284,7 @@ static void save_default_sound(const ble_addr_t *addr, int sound) {
    ========================= */
 
 // All valid sound IDs in cycling order
-static const int SOUND_LIST[]  = {3, 5, 7, 9, 10};
+static const int SOUND_LIST[]  = {3, 5, 7, 9, 10, 0};
 #define SOUND_LIST_LEN (sizeof(SOUND_LIST) / sizeof(SOUND_LIST[0]))
 
 static int default_sound      = 10;  // loaded from NVS on connect
@@ -702,7 +702,8 @@ void control_task(void *arg) {
                     sound_select_mode  = 1;
                     sound_select_index = sound_to_index(default_sound);
                     stop_press_count   = 0;
-                    beeper_play_sound(default_sound);
+                    beeper_play_tone(3);
+                    // beeper_play_sound(default_sound);
                     ESP_LOGI("SoundSel",
                              "Entered sound-select mode (current sound=%d)",
                              default_sound);
