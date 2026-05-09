@@ -14,6 +14,29 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/semphr.h"
+#include "esp_sleep.h"
+
+
+
+
+/* =========================
+   GPIO pins
+   ========================= */
+#define GPIO_FORWARD  GPIO_NUM_0
+#define GPIO_STOP     GPIO_NUM_1
+#define GPIO_BACKWARD GPIO_NUM_2
+
+
+#define NVS_NAMESPACE "train_cfg"
+#define BUTTON_DEBOUNCE_MS 250
+
+#define COOLDOWN_RED_MS    2000
+#define COOLDOWN_YELLOW_MS 2000
+#define COOLDOWN_GREEN_MS  2000
+#define COOLDOWN_BLUE_MS   2000
+#define COOLDOWN_WHITE_MS  2000
+#define INACTIVITY_TIMEOUT_MS (10 * 60 * 1000)  // 10 minutes
+
 
 static SemaphoreHandle_t ble_write_sem;
 
@@ -38,12 +61,6 @@ static int ble_write_cb(uint16_t conn_handle,
    ========================= */
 void ble_app_on_sync(void);
 
-/* =========================
-   GPIO pins
-   ========================= */
-#define GPIO_FORWARD  GPIO_NUM_0
-#define GPIO_STOP     GPIO_NUM_1
-#define GPIO_BACKWARD GPIO_NUM_2
 
 /* =========================
    BLE target UUID
@@ -52,9 +69,6 @@ static const ble_uuid128_t target_char_uuid = BLE_UUID128_INIT(
     0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x23, 0x16,
     0xde, 0xef, 0x12, 0x12, 0x24, 0x16, 0x00, 0x00
 );
-
-/* ========================= */
-#define MSG_PORT_VALUE_SINGLE 0x45
 
 typedef enum {
     EVT_FORWARD,
@@ -89,8 +103,6 @@ static QueueHandle_t color_action_queue;
 static TickType_t last_forward_tick  = 0;
 static TickType_t last_stop_tick     = 0;
 static TickType_t last_backward_tick = 0;
-
-#define BUTTON_DEBOUNCE_MS 250
 
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
@@ -236,10 +248,15 @@ void enable_color_sensor_notifications(void) {
     enqueue_command(data, sizeof(data));
 }
 
+void shutdown_hub(void) {
+    // Hub Action command: 0x02 = Switch Off Hub
+    uint8_t data[] = {0x04, 0x00, 0x02, 0x01};
+    enqueue_command(data, sizeof(data));
+}
+
 /* =========================
    NVS helpers (per-MAC sound)
    ========================= */
-#define NVS_NAMESPACE "train_cfg"
 
 static void addr_to_key(const ble_addr_t *addr, char *out, size_t out_len) {
     // Key: 12 hex chars from the 6 MAC bytes, e.g. "aabbccddeeff"
@@ -323,11 +340,6 @@ void process_speed_change(uint8_t *payload, int len) {
 /* =========================
    Color sensor cooldowns (ms)
    ========================= */
-#define COOLDOWN_RED_MS    2000
-#define COOLDOWN_YELLOW_MS 2000
-#define COOLDOWN_GREEN_MS  2000
-#define COOLDOWN_BLUE_MS   2000
-#define COOLDOWN_WHITE_MS  2000
 
 static TickType_t last_red_tick    = 0;
 static TickType_t last_yellow_tick = 0;
@@ -348,6 +360,49 @@ typedef enum {
     COLOR_ACTION_BLUE,
     COLOR_ACTION_WHITE
 } color_action_t;
+
+
+/* =========================
+   Inactivity shutdown
+   ========================= */
+
+static volatile TickType_t last_activity_tick = 0;
+
+void update_activity(void) {
+    last_activity_tick = xTaskGetTickCount();
+}
+
+void watchdog_task(void *arg) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(15000));  // check every 15 seconds
+
+        TickType_t elapsed = (xTaskGetTickCount() - last_activity_tick) * portTICK_PERIOD_MS;
+
+        if (last_activity_tick != 0 && elapsed >= INACTIVITY_TIMEOUT_MS) {
+            ESP_LOGI("Watchdog", "Inactivity timeout — shutting down");
+
+            while(device_connected) {
+                ESP_LOGI("Watchdog", "Send hub shutdown command");
+
+                xQueueReset(cmd_queue);
+                xQueueReset(movement_evt_queue);
+                xQueueReset(color_action_queue);
+
+                shutdown_hub();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+
+            // // Disconnect BLE
+            // if (device_connected) {
+            //     ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            //     vTaskDelay(pdMS_TO_TICKS(500));
+            // }
+
+            // Deep sleep forever (wake on reset button only)
+            esp_deep_sleep_start();
+        }
+    }
+}
 
 /* =========================
    Color action task
@@ -455,9 +510,9 @@ void process_color_sensor(uint8_t *payload, int len)
 void parse_message(uint8_t *data, int len) {
     if (len < 5) return;
 
-    if (data[2] == MSG_PORT_VALUE_SINGLE && data[3] == 0x13) {
+    if (data[2] == 0x45 && data[3] == 0x13) {
         process_speed_change(&data[4], len - 4);
-    } else if (data[2] == MSG_PORT_VALUE_SINGLE && data[3] == 0x12) {
+    } else if (data[2] == 0x45 && data[3] == 0x12) {
         process_color_sensor(&data[4], len - 4);
     }
 }
@@ -643,6 +698,8 @@ void control_task(void *arg) {
 
         if (!xQueueReceive(movement_evt_queue, &evt, portMAX_DELAY)) continue;
 
+        update_activity();
+
         /* ------------------------------------------------
            Sound-selection mode
            Forward  → preview next sound (cycles through list)
@@ -760,6 +817,7 @@ void app_main(void) {
     xTaskCreate(ble_tx_task,       "ble_tx",       4096, NULL, 5, NULL);
     xTaskCreate(control_task,      "control",      4096, NULL, 5, NULL);
     xTaskCreate(color_action_task, "color_action", 4096, NULL, 5, NULL);
+    xTaskCreate(watchdog_task,     "watchdog",     2048, NULL, 3, NULL);
 
     config_gpio();
 }
